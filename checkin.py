@@ -229,7 +229,8 @@ def run_meet(c: Client, state_path: str, max_add: int = 0) -> dict:
                 nick = ((detail or {}).get("userInfo") or {}).get("nickname")
             else:
                 seen.add(str(uid))  # 失败也标记, 避免反复重试
-            res["added_detail"].append({"uid": uid, "nickname": nick, "sent": succ})
+            res["added_detail"].append({"uid": uid, "nickname": nick, "sent": succ,
+                                        "city": rec.get("cityName")})
             if succ:
                 res["added"].append(uid)
         except Exception:
@@ -361,18 +362,39 @@ def build_interactive_card(results: list) -> dict:
 
 
 def notify_meet(meet: dict):
-    """寻访到好友时单独推送一条飞书消息"""
+    """寻访到好友时单独推送一条飞书卡片"""
     details = meet.get("added_detail") or []
     if not details:
         return
+    now = datetime.now().strftime("%m-%d %H:%M")
+    all_sent = all(d_.get("sent") for d_ in details)
+
     lines = []
     for d_ in details:
-        mark = "已自动发送好友请求" if d_.get("sent") else "好友请求发送失败"
-        lines.append(f"{d_.get('nickname') or d_['uid']} (uid {d_['uid']}) - {mark}")
+        name = d_.get("nickname") or str(d_["uid"])
+        mark = "好友请求已发送" if d_.get("sent") else "好友请求发送失败"
+        city = f" · {d_['city']}" if d_.get("city") else ""
+        lines.append(f"**{name}**{city}\n"
+                     f"uid {d_['uid']}  ·  {mark}")
+    body = "\n\n".join(lines)
+
     payload = {
-        "msg_type": "text",
-        "content": {"text": "同调计划寻访到新搭子\n" + "\n".join(lines)
-                           + f"\n共 {len(details)} 人 · 等待对方通过"},
+        "msg_type": "interactive",
+        "card": {
+            "config": {"wide_screen_mode": True},
+            "header": {
+                "title": {"tag": "plain_text",
+                          "content": ("寻访到新搭子 · 已发好友请求 " if all_sent
+                                      else "寻访结果 · 部分发送失败 ") + now},
+                "template": "green" if all_sent else "orange",
+            },
+            "elements": [
+                {"tag": "markdown", "content": body},
+                {"tag": "hr"},
+                {"tag": "note", "elements": [{"tag": "plain_text",
+                 "content": "SYNC.PROJECT 每日寻访 · 等待对方通过后成为好友"}]},
+            ],
+        },
     }
     url = os.environ.get("SYNC_FEISHU_WEBHOOK", "").strip()
     if url:
