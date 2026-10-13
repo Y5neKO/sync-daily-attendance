@@ -12,6 +12,8 @@
   SYNC_FEISHU_WEBHOOK  可选, 飞书自定义机器人 webhook (open.feishu.cn/open-apis/bot/v2/hook/xxx)
   SYNC_MAX_RETRIES     可选, 单账号最大重试次数, 默认 3
   SYNC_DELAY           可选, 每次打招呼间隔秒数, 默认 1.5
+  SYNC_MEET_ENABLE     可选, 启用每日寻访加好友, 默认 true (设 false 关闭)
+  SYNC_MEET_STATE_FILE 可选, 寻访状态文件路径, 默认 meet_state.json
 """
 import hashlib
 import json
@@ -88,6 +90,20 @@ class Client:
         return self.call("api/friends/ping", "POST",
                          json.dumps({"friendUserId": friend_user_id}))
 
+    def pick_bottle(self):
+        """寻访捞瓶 (消耗 2 理智, 理智不足时返回业务 fail)"""
+        return self.call("api/drift-bottle/pick", "POST", json.dumps({}))
+
+    def pending_list(self):
+        """全部捞瓶记录 (含瓶主 userId, 可发起加好友)"""
+        r = self.call("app/pollingTask/getPendingList?lastTime=0")
+        d = self._json(r) or {}
+        return d.get("list") or []
+
+    def add_friend(self, friend_user_id: int):
+        return self.call("api/friends/addFriend", "POST",
+                         json.dumps({"friendUserId": friend_user_id}))
+
 
 def run_account(cookie: str, idx: int, delay: float, retries: int) -> dict:
     """执行单账号签到, 返回结构化结果"""
@@ -144,6 +160,68 @@ def run_account(cookie: str, idx: int, delay: float, retries: int) -> dict:
             res["error"] = f"执行异常: {e}"
             if attempt < retries:
                 time.sleep(5)
+    return res
+
+
+# ---------------- 每日寻访加好友 ----------------
+
+def load_meet_state(path):
+    if os.path.exists(path):
+        return json.load(open(path))
+    return {"added": [], "seen": []}
+
+
+def save_meet_state(path, st):
+    json.dump(st, open(path, "w"))
+
+
+def run_meet(c: Client, state_path: str, max_add: int = 0) -> dict:
+    """每日寻访加好友:
+    1. pick 尝试捞瓶 (消耗 2 理智; 理智不足/无可捞则跳过, 不算失败)
+    2. 拉取全部捞瓶记录, 提取瓶主 userId
+    3. 对未处理过的 userId 逐个 addFriend
+    首次运行将历史记录记为基线 (不发送请求), 之后只加新捞到的
+    """
+    st = load_meet_state(state_path)
+    added, seen = set(st.get("added", [])), set(st.get("seen", []))
+    res = {"pick_ok": False, "pick_msg": "", "new_records": 0, "added": [], "skipped_base": 0}
+
+    # 1) 尝试捞瓶
+    d = c._json(c.pick_bottle())
+    res["pick_msg"] = (d or {}).get("msg", "")[:40]
+
+    # 2) 全量捞瓶记录
+    records = c.pending_list()
+    user_ids = []
+    for rec in records:
+        uid = rec.get("userId")
+        if uid and str(uid) not in seen and str(uid) not in added:
+            user_ids.append(int(uid))
+
+    # 3) 首次基线: 只记录不加
+    if not seen and not added:
+        seen.update(str(u) for u in user_ids)
+        seen.update(added)
+        save_meet_state(state_path, {"added": sorted(added), "seen": sorted(seen)})
+        res["skipped_base"] = len(user_ids)
+        return res
+
+    # 4) 逐个加好友
+    for uid in user_ids:
+        if max_add and len(res["added"]) >= max_add:
+            break
+        try:
+            d = c._json(c.add_friend(uid))
+            if d and d.get("succ"):
+                added.add(str(uid))
+                res["added"].append(uid)
+            else:
+                seen.add(str(uid))  # 失败也标记, 避免反复重试
+        except Exception:
+            seen.add(str(uid))
+        time.sleep(1)
+    res["new_records"] = len(user_ids)
+    save_meet_state(state_path, {"added": sorted(added), "seen": sorted(seen)})
     return res
 
 
@@ -267,7 +345,7 @@ def build_interactive_card(results: list) -> dict:
     }
 
 
-def notify(results: list):
+def notify(results: list, meet: dict = None):
     webhook = os.environ.get("SYNC_FEISHU_WEBHOOK", "").strip()
     app_id = os.environ.get("SYNC_FEISHU_APP_ID", "").strip()
     app_secret = os.environ.get("SYNC_FEISHU_APP_SECRET", "").strip()
@@ -298,7 +376,24 @@ def main():
     delay = float(os.environ.get("SYNC_DELAY", "1.5"))
     retries = int(os.environ.get("SYNC_MAX_RETRIES", "3"))
 
+    meet_enable = os.environ.get("SYNC_MEET_ENABLE", "true").lower() in ("1", "true", "yes")
+    meet_state = os.environ.get("SYNC_MEET_STATE_FILE", "meet_state.json")
+    meet_max = int(os.environ.get("SYNC_MEET_MAX_ADD", "0"))
+
     results = [run_account(ck, i, delay, retries) for i, ck in enumerate(cookies)]
+
+    meet_res = None
+    if meet_enable:
+        try:
+            mc = Client(cookies[0])
+            meet_res = run_meet(mc, meet_state)
+            print(f"[meet] 捞瓶: {meet_res['pick_msg'] or '跳过'} | "
+                  f"新记录 {meet_res['new_records']} | 已加好友 {len(meet_res['added'])} | "
+                  f"基线跳过 {meet_res['skipped_base']}")
+        except SessionDead:
+            print("[meet] 会话失效, 跳过寻访")
+        except Exception as e:
+            print(f"[meet] 异常: {e}")
 
     for r in results:
         if r["ok"]:
@@ -308,7 +403,7 @@ def main():
         else:
             print(f"[{r['nickname']}] 失败: {r['error']}")
 
-    notify(results)
+    notify(results, meet_res)
     if not all(r["ok"] for r in results):
         sys.exit(1)
 
