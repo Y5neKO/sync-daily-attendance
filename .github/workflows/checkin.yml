@@ -1,0 +1,29 @@
+name: SYNC PROJECT daily greeting
+
+on:
+  schedule:
+    # GitHub Actions cron 为 UTC; 北京时间 = UTC + 8
+    - cron: '0 1 * * *'    # 北京 09:00
+    - cron: '0 13 * * *'   # 北京 21:00
+  workflow_dispatch: {}     # 支持手动触发
+
+jobs:
+  checkin:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install deps
+        run: pip install requests pillow
+
+      - name: Run daily greeting
+        env:
+          SYNC_COOKIES: ${{ secrets.SYNC_COOKIES }}
+          SYNC_FEISHU_WEBHOOK: ${{ secrets.SYNC_FEISHU_WEBHOOK }}
+          SYNC_MAX_RETRIES: '3'
+          SYNC_DELAY: '1.5'
+        run: python checkin.py
