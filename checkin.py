@@ -183,8 +183,9 @@ def run_meet(c: Client, state_path: str, max_add: int = 0) -> dict:
     首次运行将历史记录记为基线 (不发送请求), 之后只加新捞到的
     """
     st = load_meet_state(state_path)
-    added, seen = set(st.get("added", [])), set(st.get("seen", []))
-    res = {"pick_ok": False, "pick_msg": "", "new_records": 0, "added": [], "skipped_base": 0}
+    added, seen = set(str(x) for x in st.get("added", [])), set(str(x) for x in st.get("seen", []))
+    res = {"pick_ok": False, "pick_msg": "", "new_records": 0,
+           "added": [], "added_detail": [], "skipped_base": 0}
 
     # 1) 尝试捞瓶
     d = c._json(c.pick_bottle())
@@ -201,22 +202,36 @@ def run_meet(c: Client, state_path: str, max_add: int = 0) -> dict:
     # 3) 首次基线: 只记录不加
     if not seen and not added:
         seen.update(str(u) for u in user_ids)
-        seen.update(added)
         save_meet_state(state_path, {"added": sorted(added), "seen": sorted(seen)})
         res["skipped_base"] = len(user_ids)
         return res
 
-    # 4) 逐个加好友
+    # 4) 逐个加好友, 并取对方昵称用于推送
+    rec_by_uid = {}
+    for rec in records:
+        uid = rec.get("userId")
+        if uid:
+            rec_by_uid[str(uid)] = rec
+
     for uid in user_ids:
         if max_add and len(res["added"]) >= max_add:
             break
+        nick = None
+        rec = rec_by_uid.get(str(uid)) or {}
         try:
             d = c._json(c.add_friend(uid))
-            if d and d.get("succ"):
+            succ = bool(d and d.get("succ"))
+            if succ:
                 added.add(str(uid))
-                res["added"].append(uid)
+                # 通过瓶子 id 拉对方资料拿昵称
+                detail = c._json(c.call(f"api/drift-bottle/getUserDetail/{rec.get('id')}",
+                                        "POST", json.dumps({})))
+                nick = ((detail or {}).get("userInfo") or {}).get("nickname")
             else:
                 seen.add(str(uid))  # 失败也标记, 避免反复重试
+            res["added_detail"].append({"uid": uid, "nickname": nick, "sent": succ})
+            if succ:
+                res["added"].append(uid)
         except Exception:
             seen.add(str(uid))
         time.sleep(1)
