@@ -360,6 +360,29 @@ def build_interactive_card(results: list) -> dict:
     }
 
 
+def notify_meet(meet: dict):
+    """寻访到好友时单独推送一条飞书消息"""
+    details = meet.get("added_detail") or []
+    if not details:
+        return
+    lines = []
+    for d_ in details:
+        mark = "已自动发送好友请求" if d_.get("sent") else "好友请求发送失败"
+        lines.append(f"{d_.get('nickname') or d_['uid']} (uid {d_['uid']}) - {mark}")
+    payload = {
+        "msg_type": "text",
+        "content": {"text": "同调计划寻访到新搭子\n" + "\n".join(lines)
+                           + f"\n共 {len(details)} 人 · 等待对方通过"},
+    }
+    url = os.environ.get("SYNC_FEISHU_WEBHOOK", "").strip()
+    if url:
+        try:
+            r = requests.post(url, json=payload, timeout=15)
+            print(f"[meet notify] {r.json()}")
+        except Exception as e:
+            print(f"[meet notify failed] {e}")
+
+
 def notify(results: list, meet: dict = None):
     webhook = os.environ.get("SYNC_FEISHU_WEBHOOK", "").strip()
     app_id = os.environ.get("SYNC_FEISHU_APP_ID", "").strip()
@@ -409,6 +432,8 @@ def main():
             print("[meet] 会话失效, 跳过寻访")
         except Exception as e:
             print(f"[meet] 异常: {e}")
+        else:
+            notify_meet(meet_res)
 
     for r in results:
         if r["ok"]:
