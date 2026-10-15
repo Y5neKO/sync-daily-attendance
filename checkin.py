@@ -175,29 +175,51 @@ def save_meet_state(path, st):
     json.dump(st, open(path, "w"))
 
 
-def run_meet(c: Client, state_path: str, max_add: int = 0) -> dict:
+def run_meet(c: Client, state_path: str, max_add: int = 0,
+             wait_minutes: int = 35) -> dict:
     """每日寻访加好友:
-    1. pick 尝试捞瓶 (消耗 2 理智; 理智不足/无可捞则跳过, 不算失败)
-    2. 拉取全部捞瓶记录, 提取瓶主 userId
-    3. 对未处理过的 userId 逐个 addFriend
+    1. pick 发起寻访 (消耗 2 理智; nopoint=理智不足则直接结束)
+    2. 寻访为异步检索 (最长约 30 分钟): 每 5 分钟轮询 pendingList 等新记录
+    3. 对新出现的瓶主逐个 addFriend, 并单独推送飞书
     首次运行将历史记录记为基线 (不发送请求), 之后只加新捞到的
     """
     st = load_meet_state(state_path)
     added, seen = set(str(x) for x in st.get("added", [])), set(str(x) for x in st.get("seen", []))
     res = {"pick_ok": False, "pick_msg": "", "new_records": 0,
-           "added": [], "added_detail": [], "skipped_base": 0}
+           "added": [], "added_detail": [], "skipped_base": 0, "waited": False}
 
-    # 1) 尝试捞瓶
+    # 1) 发起寻访
     d = c._json(c.pick_bottle())
     res["pick_msg"] = (d or {}).get("msg", "")[:40]
+    res["pick_ok"] = bool(d and d.get("succ"))
+    print(f"[meet] pick: {res['pick_msg']}")
 
-    # 2) 全量捞瓶记录
-    records = c.pending_list()
-    user_ids = []
-    for rec in records:
-        uid = rec.get("userId")
-        if uid and str(uid) not in seen and str(uid) not in added:
-            user_ids.append(int(uid))
+    # 理智不足等其他失败: 不轮询, 直接走记录基线流程
+    # 2) 拉取当前记录
+    def fetch_new_ids():
+        records = c.pending_list()
+        ids = []
+        rec_by_uid = {}
+        for rec in records:
+            uid = rec.get("userId")
+            if uid and str(uid) not in seen and str(uid) not in added:
+                ids.append(int(uid))
+                rec_by_uid[str(uid)] = rec
+        return ids, rec_by_uid
+
+    user_ids, rec_by_uid = fetch_new_ids()
+
+    # 2.5) pick 成功但没有立即出新记录: 异步检索, 轮询等待
+    if res["pick_ok"] and not user_ids and wait_minutes > 0:
+        print(f"[meet] 寻访检索中, 轮询等待最长 {wait_minutes} 分钟...")
+        deadline = time.time() + wait_minutes * 60
+        while time.time() < deadline:
+            time.sleep(300)
+            user_ids, rec_by_uid = fetch_new_ids()
+            res["waited"] = True
+            print(f"[meet] poll: {len(user_ids)} new")
+            if user_ids:
+                break
 
     # 3) 首次基线: 只记录不加
     if not seen and not added:
@@ -207,12 +229,6 @@ def run_meet(c: Client, state_path: str, max_add: int = 0) -> dict:
         return res
 
     # 4) 逐个加好友, 并取对方昵称用于推送
-    rec_by_uid = {}
-    for rec in records:
-        uid = rec.get("userId")
-        if uid:
-            rec_by_uid[str(uid)] = rec
-
     for uid in user_ids:
         if max_add and len(res["added"]) >= max_add:
             break
