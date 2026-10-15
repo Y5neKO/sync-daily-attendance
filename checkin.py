@@ -14,6 +14,9 @@
   SYNC_DELAY           可选, 每次打招呼间隔秒数, 默认 1.5
   SYNC_MEET_ENABLE     可选, 启用每日寻访加好友, 默认 true (设 false 关闭)
   SYNC_MEET_STATE_FILE 可选, 寻访状态文件路径, 默认 meet_state.json
+  SYNC_MEET_PICKS      可选, 每次运行寻访次数, 默认 1 (每次消耗 2 理智)
+  SYNC_MEET_CODE       可选, 寻访挂名干员代号, 默认 R00A
+  SYNC_MEET_KEEP_SANITY 可选, 保留理智点数, 默认 0; 例: 设 8 则理智低于 10 时不再寻访
 """
 import hashlib
 import json
@@ -104,6 +107,16 @@ class Client:
         return self.call("api/friends/addFriend", "POST",
                          json.dumps({"friendUserId": friend_user_id}))
 
+    def sanity(self):
+        """当前理智余量 (my-bottles 响应的 point 字段); 查询失败返回 None 不限制"""
+        try:
+            r = self.call("api/drift-bottle/my-bottles?type=picked&pageIndex=1&pageSize=1")
+            d = self._json(r) or {}
+            p = d.get("point")
+            return int(p) if p is not None else None
+        except Exception:
+            return None
+
 
 def run_account(cookie: str, idx: int, delay: float, retries: int) -> dict:
     """执行单账号签到, 返回结构化结果"""
@@ -176,7 +189,7 @@ def save_meet_state(path, st):
 
 
 def run_meet(c: Client, state_path: str, max_pick: int = 1,
-             code: str = "R00A", max_add: int = 0) -> dict:
+             code: str = "R00A", max_add: int = 0, keep_sanity: int = 0) -> dict:
     """每日寻访加好友:
     每次寻访消耗 2 理智, pick 成功时响应直接返回捞到的用户完整档案
     (无须等待/轮询), 对其 addFriend 后进入推送
@@ -209,6 +222,16 @@ def run_meet(c: Client, state_path: str, max_pick: int = 1,
         return (d.get("data") is None and d.get("succ")) or "没有漂流瓶" in (d.get("msg") or "")
 
     for i in range(max_pick):
+        # 理智检查: 每次 pick 消耗 2 点, 低于 (保留值 + 2) 则停止
+        point = c.sanity()
+        if point is not None:
+            if point < 2:
+                res["pick_msg"] = f"理智不足 (剩 {point})"
+                break
+            if point - 2 < keep_sanity:
+                res["pick_msg"] = f"到达保留线 (剩 {point}, 保留 {keep_sanity})"
+                break
+            print(f"[meet] 理智 {point}/{point // 2}次可用, 本次第 {i + 1}/{max_pick} 次")
         d = c._json(c.pick_bottle(code))
         if not d:
             res["pick_msg"] = "no response"
@@ -435,6 +458,7 @@ def main():
     meet_max = int(os.environ.get("SYNC_MEET_MAX_ADD", "0"))
     meet_picks = int(os.environ.get("SYNC_MEET_PICKS", "1"))
     meet_code = os.environ.get("SYNC_MEET_CODE", "R00A")
+    meet_keep = int(os.environ.get("SYNC_MEET_KEEP_SANITY", "0"))
 
     results = [run_account(ck, i, delay, retries) for i, ck in enumerate(cookies)]
 
@@ -442,7 +466,8 @@ def main():
     if meet_enable:
         try:
             mc = Client(cookies[0])
-            meet_res = run_meet(mc, meet_state, max_pick=meet_picks, code=meet_code)
+            meet_res = run_meet(mc, meet_state, max_pick=meet_picks, code=meet_code,
+                                keep_sanity=meet_keep)
             print(f"[meet] 寻访 {meet_res['picked']} 次 | "
                   f"新结识: {', '.join(meet_res['met']) or '无'}")
         except SessionDead:

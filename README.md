@@ -34,7 +34,14 @@ GitHub Actions 定时任务 + Secrets 凭证注入 + 失败通知 + 多账号。
    | `SYNC_MAX_RETRIES` | 重试次数，默认 3 | 可选 |
    | `SYNC_DELAY` | 打招呼间隔秒数，默认 1.5 | 可选 |
    | `SYNC_MEET_ENABLE` | 每日寻访加好友开关，默认 `true`（设 `false` 关闭） | 可选 |
+   | `SYNC_MEET_PICKS` | 每次运行寻访次数，默认 `1`（**每次寻访消耗 2 理智**） | 可选 |
+   | `SYNC_MEET_KEEP_SANITY` | 保留理智点数，默认 `0`。例：设 `8` 则理智余量 <10 时停止寻访（12 点满仓 = 最多寻访 2 次） | 可选 |
+   | `SYNC_MEET_CODE` | 寻访挂名干员代号，默认 `R00A`（可露希尔） | 可选 |
    | `SYNC_MEET_MAX_ADD` | 单次最多自动添加 N 个好友，`0` 不限 | 可选 |
+
+   **理智与寻访次数关系**：理智上限 12，每 04:00 刷新；**1 次寻访 = 2 理智 = 满仓 6 次**。
+   `SYNC_MEET_PICKS` 控制单次运行上限，`SYNC_MEET_KEEP_SANITY` 控制余量下限，两者先到先停。
+   理智查询失败时自动跳过限制检查（不阻断签到）。
 
 3. `Actions` 页面手动 Run workflow 验证一次
 4. 之后每天 09:00 / 21:00 自动执行（GitHub cron 可能有 5~30 分钟延迟）
