@@ -226,29 +226,10 @@ def run_meet(c: Client, state_path: str, max_pick: int = 1,
         if "nopoint" in (d.get("msg") or "").lower() or "理智" in (d.get("msg") or ""):
             break
 
-        # 瓶子池暂时为空: 轮询等待系统匹配 (最长 30 分钟, 每 3 分钟一次)
+        # 瓶子池暂时为空: 直接结束 (每次 pick 都消耗理智, 空池重试会白烧寻访次数)
         if pool_empty(d):
             res["pick_ok"] = True
-            print(f"[meet] 瓶子池为空, 轮询等待匹配 (最长 30 分钟)...")
-            deadline = time.time() + 30 * 60
-            matched = False
-            while time.time() < deadline:
-                time.sleep(180)
-                d = c._json(c.pick_bottle(code))
-                if not d:
-                    continue
-                res["pick_msg"] = (d.get("msg") or "")[:30]
-                if d.get("succ") and d.get("userInfo"):
-                    res["pick_ok"] = True
-                    res["picked"] += 1
-                    consume(d)
-                    matched = True
-                    break
-                if "nopoint" in (d.get("msg") or "").lower():
-                    break
-            if matched:
-                continue
-        break
+            break
 
     save_meet_state(state_path, {"added": sorted(added), "seen": sorted(seen)})
     return res
