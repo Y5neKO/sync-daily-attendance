@@ -90,9 +90,9 @@ class Client:
         return self.call("api/friends/ping", "POST",
                          json.dumps({"friendUserId": friend_user_id}))
 
-    def pick_bottle(self):
-        """寻访捞瓶 (消耗 2 理智, 理智不足时返回业务 fail)"""
-        return self.call("api/drift-bottle/pick", "POST", json.dumps({}))
+    def pick_bottle(self, code: str = "R00A"):
+        """寻访捞瓶 (消耗 2 理智)。code=挂名干员代号; 成功时响应直接返回捞到的用户档案"""
+        return self.call("api/drift-bottle/pick", "POST", json.dumps({"code": code}))
 
     def pending_list(self):
         """全部捞瓶记录 (含瓶主 userId, 可发起加好友)"""
@@ -175,84 +175,81 @@ def save_meet_state(path, st):
     json.dump(st, open(path, "w"))
 
 
-def run_meet(c: Client, state_path: str, max_add: int = 0,
-             wait_minutes: int = 35) -> dict:
+def run_meet(c: Client, state_path: str, max_pick: int = 1,
+             code: str = "R00A", max_add: int = 0) -> dict:
     """每日寻访加好友:
-    1. pick 发起寻访 (消耗 2 理智; nopoint=理智不足则直接结束)
-    2. 寻访为异步检索 (最长约 30 分钟): 每 5 分钟轮询 pendingList 等新记录
-    3. 对新出现的瓶主逐个 addFriend, 并单独推送飞书
-    首次运行将历史记录记为基线 (不发送请求), 之后只加新捞到的
+    每次寻访消耗 2 理智, pick 成功时响应直接返回捞到的用户完整档案
+    (无须等待/轮询), 对其 addFriend 后进入推送
     """
     st = load_meet_state(state_path)
     added, seen = set(str(x) for x in st.get("added", [])), set(str(x) for x in st.get("seen", []))
-    res = {"pick_ok": False, "pick_msg": "", "new_records": 0,
-           "added": [], "added_detail": [], "skipped_base": 0, "waited": False}
+    res = {"pick_ok": False, "pick_msg": "", "met": [],
+           "added_detail": [], "picked": 0}
 
-    # 1) 发起寻访
-    d = c._json(c.pick_bottle())
-    res["pick_msg"] = (d or {}).get("msg", "")[:40]
-    res["pick_ok"] = bool(d and d.get("succ"))
-    print(f"[meet] pick: {res['pick_msg']}")
+    def consume(d) -> dict:
+        """pick 成功: 处理捞到的用户 (加好友+记录), 返回用户信息"""
+        u = d.get("userInfo") or {}
+        uid = str(u.get("id"))
+        nick = u.get("nickname") or uid
+        if uid in added or uid in seen:
+            return {}
+        d2 = c._json(c.add_friend(int(u.get("id"))))
+        sent = bool(d2 and d2.get("succ"))
+        if sent:
+            added.add(uid)
+        else:
+            seen.add(uid)
+        info = {"uid": uid, "nickname": nick, "sent": sent,
+                "city": u.get("cityName"), "level": u.get("level")}
+        res["met"].append(nick)
+        res["added_detail"].append(info)
+        return info
 
-    # 理智不足等其他失败: 不轮询, 直接走记录基线流程
-    # 2) 拉取当前记录
-    def fetch_new_ids():
-        records = c.pending_list()
-        ids = []
-        rec_by_uid = {}
-        for rec in records:
-            uid = rec.get("userId")
-            if uid and str(uid) not in seen and str(uid) not in added:
-                ids.append(int(uid))
-                rec_by_uid[str(uid)] = rec
-        return ids, rec_by_uid
+    def pool_empty(d) -> bool:
+        return (d.get("data") is None and d.get("succ")) or "没有漂流瓶" in (d.get("msg") or "")
 
-    user_ids, rec_by_uid = fetch_new_ids()
-
-    # 2.5) pick 成功但没有立即出新记录: 异步检索, 轮询等待
-    if res["pick_ok"] and not user_ids and wait_minutes > 0:
-        print(f"[meet] 寻访检索中, 轮询等待最长 {wait_minutes} 分钟...")
-        deadline = time.time() + wait_minutes * 60
-        while time.time() < deadline:
-            time.sleep(300)
-            user_ids, rec_by_uid = fetch_new_ids()
-            res["waited"] = True
-            print(f"[meet] poll: {len(user_ids)} new")
-            if user_ids:
-                break
-
-    # 3) 首次基线: 只记录不加
-    if not seen and not added:
-        seen.update(str(u) for u in user_ids)
-        save_meet_state(state_path, {"added": sorted(added), "seen": sorted(seen)})
-        res["skipped_base"] = len(user_ids)
-        return res
-
-    # 4) 逐个加好友, 并取对方昵称用于推送
-    for uid in user_ids:
-        if max_add and len(res["added"]) >= max_add:
+    for i in range(max_pick):
+        d = c._json(c.pick_bottle(code))
+        if not d:
+            res["pick_msg"] = "no response"
             break
-        nick = None
-        rec = rec_by_uid.get(str(uid)) or {}
-        try:
-            d = c._json(c.add_friend(uid))
-            succ = bool(d and d.get("succ"))
-            if succ:
-                added.add(str(uid))
-                # 通过瓶子 id 拉对方资料拿昵称
-                detail = c._json(c.call(f"api/drift-bottle/getUserDetail/{rec.get('id')}",
-                                        "POST", json.dumps({})))
-                nick = ((detail or {}).get("userInfo") or {}).get("nickname")
-            else:
-                seen.add(str(uid))  # 失败也标记, 避免反复重试
-            res["added_detail"].append({"uid": uid, "nickname": nick, "sent": succ,
-                                        "city": rec.get("cityName")})
-            if succ:
-                res["added"].append(uid)
-        except Exception:
-            seen.add(str(uid))
-        time.sleep(1)
-    res["new_records"] = len(user_ids)
+        res["pick_msg"] = (d.get("msg") or "")[:30]
+
+        if d.get("succ") and d.get("userInfo"):
+            res["pick_ok"] = True
+            res["picked"] += 1
+            consume(d)
+            time.sleep(1)
+            continue
+
+        # 理智耗尽
+        if "nopoint" in (d.get("msg") or "").lower() or "理智" in (d.get("msg") or ""):
+            break
+
+        # 瓶子池暂时为空: 轮询等待系统匹配 (最长 30 分钟, 每 3 分钟一次)
+        if pool_empty(d):
+            res["pick_ok"] = True
+            print(f"[meet] 瓶子池为空, 轮询等待匹配 (最长 30 分钟)...")
+            deadline = time.time() + 30 * 60
+            matched = False
+            while time.time() < deadline:
+                time.sleep(180)
+                d = c._json(c.pick_bottle(code))
+                if not d:
+                    continue
+                res["pick_msg"] = (d.get("msg") or "")[:30]
+                if d.get("succ") and d.get("userInfo"):
+                    res["pick_ok"] = True
+                    res["picked"] += 1
+                    consume(d)
+                    matched = True
+                    break
+                if "nopoint" in (d.get("msg") or "").lower():
+                    break
+            if matched:
+                continue
+        break
+
     save_meet_state(state_path, {"added": sorted(added), "seen": sorted(seen)})
     return res
 
@@ -455,6 +452,8 @@ def main():
     meet_enable = os.environ.get("SYNC_MEET_ENABLE", "true").lower() in ("1", "true", "yes")
     meet_state = os.environ.get("SYNC_MEET_STATE_FILE", "meet_state.json")
     meet_max = int(os.environ.get("SYNC_MEET_MAX_ADD", "0"))
+    meet_picks = int(os.environ.get("SYNC_MEET_PICKS", "1"))
+    meet_code = os.environ.get("SYNC_MEET_CODE", "R00A")
 
     results = [run_account(ck, i, delay, retries) for i, ck in enumerate(cookies)]
 
@@ -462,10 +461,9 @@ def main():
     if meet_enable:
         try:
             mc = Client(cookies[0])
-            meet_res = run_meet(mc, meet_state)
-            print(f"[meet] 捞瓶: {meet_res['pick_msg'] or '跳过'} | "
-                  f"新记录 {meet_res['new_records']} | 已加好友 {len(meet_res['added'])} | "
-                  f"基线跳过 {meet_res['skipped_base']}")
+            meet_res = run_meet(mc, meet_state, max_pick=meet_picks, code=meet_code)
+            print(f"[meet] 寻访 {meet_res['picked']} 次 | "
+                  f"新结识: {', '.join(meet_res['met']) or '无'}")
         except SessionDead:
             print("[meet] 会话失效, 跳过寻访")
         except Exception as e:
